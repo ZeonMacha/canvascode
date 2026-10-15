@@ -283,8 +283,14 @@ body {
 }
 
 /* Canvas Viewport */
+.canvas-viewport:has(.device-frame.responsive) {
+  padding: 0;
+}
+
 .canvas-viewport {
   flex: 1;
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
   position: relative;
   background: 
@@ -292,17 +298,19 @@ body {
   background-size: 24px 24px;
   background-color: var(--bg-app);
   display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 40px;
+  align-items: safe center;
+  justify-content: safe center;
+  padding: 24px;
 }
 
 .canvas-artboard {
-  transform-origin: center center;
-  transition: transform 0.15s ease-out;
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.studio-main {
+  min-width: 0;
+  min-height: 0;
 }
 
 /* Device Frames */
@@ -310,7 +318,7 @@ body {
   position: relative;
   background: #000;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1);
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: border-radius 0.2s ease, box-shadow 0.2s ease;
   display: flex;
   flex-direction: column;
 }
@@ -413,9 +421,31 @@ body {
   border: none;
 }
 
+.drop-overlay {
+  position: absolute;
+  inset: 24px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  border: 2px dashed #3b82f6;
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.78);
+  color: #f8fafc;
+  font-size: 18px;
+  font-weight: 650;
+  text-align: center;
+  pointer-events: none;
+}
+
+.drop-overlay[hidden] {
+  display: none;
+}
+
 /* Studio Sidebar */
 .studio-sidebar {
-  width: 320px;
+  width: 440px;
   background: var(--bg-panel);
   border-left: 1px solid var(--border-main);
   display: flex;
@@ -473,6 +503,40 @@ body {
 
 .tab-pane.active {
   display: block;
+}
+
+#tab-inspector.active {
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  overflow: hidden;
+}
+
+#docked-toolbar-empty {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.7;
+  padding: 28px 8px;
+  text-align: center;
+}
+
+#docked-toolbar-host {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  user-select: text;
+}
+
+#docked-toolbar-host[hidden],
+#docked-toolbar-empty[hidden] {
+  display: none;
+}
+
+.sync-file-hint {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 /* Inspector Form */

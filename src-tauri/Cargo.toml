@@ -1,6 +1,6 @@
 [package]
 name = "canvascode-studio"
-version = "1.0.0"
+version = "1.0.1"
 description = "CanvasCode Studio - Visual Micro-Adjustment & Multimodal AI Design Workbench"
 authors = ["Allen <@al1830329386-dev>"]
 license = "GPL-3.0"

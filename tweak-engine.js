@@ -25,6 +25,16 @@
 
 (function () {
   const HOST_ID = "ai-visual-tweak-host";
+  const studioMode = !!(window.parent && window.parent !== window);
+  let suppressToolbarPublish = false;
+  let lastDockedHtml = null;
+  let dockCssSent = false;
+  let clip = null;
+  const VISUAL_STYLE_PROPS = [
+    "color", "backgroundColor", "fontSize", "fontWeight", "fontFamily", "fontStyle",
+    "lineHeight", "letterSpacing", "textAlign", "textDecoration", "borderRadius",
+    "border", "boxShadow", "opacity"
+  ];
 
   // Toggle off if already exists
   const existing = document.getElementById(HOST_ID);
@@ -737,7 +747,30 @@
     showToast(`已重做: ${action.label || '操作'}`);
   }
 
+  function applyDomAction(action, isUndo) {
+    const el = action.el;
+    const parent = action.parent;
+    if (!el || !parent || !parent.isConnected) return;
+    const present = action.kind === "cut" ? isUndo : !isUndo;
+    if (present) {
+      if (!el.isConnected) {
+        const next = action.next;
+        if (next && next.parentNode === parent) parent.insertBefore(el, next);
+        else parent.appendChild(el);
+      }
+      selectedEl = el;
+      renderToolbar(el);
+    } else if (el.isConnected) {
+      if (selectedEl === el) selectedEl = null;
+      el.remove();
+    }
+  }
+
   function applyAction(action, isUndo) {
+    if (action.type === "dom") {
+      applyDomAction(action, isUndo);
+      return;
+    }
     const el = action.el;
     if (!el || !el.isConnected) return;
 
@@ -790,6 +823,21 @@
           label: `位移 (${t.x > 0 ? '+' : ''}${t.x}px, ${t.y > 0 ? '+' : ''}${t.y}px)`,
           tailwind: `translate-x-[${t.x}px] translate-y-[${t.y}px]`,
           snapNote: action.snapNote || ""
+        };
+      }
+    } else if (action.type === "html") {
+      el.innerHTML = isUndo ? action.prevHTML : action.nextHTML;
+      const entry = initChangeEntry(el);
+      if (isUndo && el.innerHTML === action.originalHTML) {
+        delete entry.mods.html;
+        delete entry.originalHTML;
+        if (Object.keys(entry.mods).length === 0 && !entry.comment) changes.delete(el);
+      } else {
+        entry.mods.html = {
+          original: "原始文字与换行",
+          current: "已修改文字或换行",
+          label: "修改文本与换行",
+          tailwind: "保留原有加粗、颜色标签"
         };
       }
     } else if (action.type === "comment") {
@@ -919,6 +967,179 @@
       return "text-sm";
     }
     return "";
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+    }[ch]));
+  }
+
+  function elementLabel(el) {
+    if (!el || !el.tagName) return "元素";
+    const id = el.id ? "#" + el.id : "";
+    const cls = el.classList && el.classList.length ? "." + el.classList[0] : "";
+    return "<" + el.tagName.toLowerCase() + ">" + id + cls;
+  }
+
+  function isSkippableStructure(el) {
+    if (!el || el.nodeType !== 1) return true;
+    if (el.id === HOST_ID) return true;
+    const tag = el.tagName;
+    if (["SCRIPT", "STYLE", "LINK", "BR", "WBR", "META", "NOSCRIPT", "TEMPLATE", "HEAD"].includes(tag)) return true;
+    if (el.hasAttribute && el.hasAttribute("data-canvascode-ignore")) return true;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.display === "contents") return true;
+    return false;
+  }
+
+  function layoutAncestor(el) {
+    let parent = el ? el.parentElement : null;
+    while (parent && parent !== document.documentElement) {
+      if (parent === document.body || !isSkippableStructure(parent)) return parent;
+      parent = parent.parentElement;
+    }
+    return null;
+  }
+
+  function layoutChildren(el) {
+    const found = [];
+    function visit(node) {
+      Array.from(node.children || []).forEach((child) => {
+        if (isSkippableStructure(child)) {
+          const display = window.getComputedStyle(child).display;
+          if (display === "contents") visit(child);
+          return;
+        }
+        const rect = child.getBoundingClientRect();
+        if (rect.width >= 1 && rect.height >= 1) found.push(child);
+        else visit(child);
+      });
+    }
+    if (el) visit(el);
+    return found;
+  }
+
+  function peerCandidates(el) {
+    let node = el;
+    while (node && node !== document.documentElement) {
+      const parent = layoutAncestor(node);
+      if (!parent) break;
+      const kids = layoutChildren(parent);
+      if (kids.length > 1 && kids.some((kid) => kid === node || kid.contains(node))) {
+        return kids.map((kid) => {
+          if (kid === el || kid.contains(el)) return el;
+          if (el.tagName && kid.tagName === el.tagName) return kid;
+          const same = el.tagName ? kid.querySelector(el.tagName.toLowerCase()) : null;
+          if (same && !isSkippableStructure(same)) return same;
+          return kid;
+        });
+      }
+      node = parent;
+    }
+    return layoutChildren(document.body);
+  }
+
+  function peerInDirection(el, direction) {
+    const rect = el.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let best = null;
+    let bestScore = Infinity;
+    peerCandidates(el).forEach((candidate) => {
+      if (!candidate || candidate === el) return;
+      const box = candidate.getBoundingClientRect();
+      if (box.width < 1 || box.height < 1) return;
+      const dx = box.left + box.width / 2 - cx;
+      const dy = box.top + box.height / 2 - cy;
+      if (direction === "up" && dy >= -2) return;
+      if (direction === "down" && dy <= 2) return;
+      if (direction === "left" && dx >= -2) return;
+      if (direction === "right" && dx <= 2) return;
+      const primary = direction === "up" || direction === "down" ? Math.abs(dy) : Math.abs(dx);
+      const cross = direction === "up" || direction === "down" ? Math.abs(dx) : Math.abs(dy);
+      if (cross > primary * 1.35 + 28) return;
+      const score = primary + cross * 0.25;
+      if (score < bestScore) {
+        bestScore = score;
+        best = candidate;
+      }
+    });
+    return best;
+  }
+
+  function firstSelectable() {
+    const nodes = layoutChildren(document.body);
+    return nodes.length ? nodes[0] : null;
+  }
+
+  function chooseSelection(el) {
+    if (!el || el === document.documentElement) return;
+    selectedEl = el;
+    renderToolbar(el);
+    updateSelection();
+    if (el.scrollIntoView) el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  function moveSelection(key, shiftKey) {
+    const direction = String(key || "").toLowerCase().replace("arrow", "");
+    if (!["up", "down", "left", "right"].includes(direction)) return;
+    if (shiftKey && selectedEl) {
+      nudgeSelection(direction, true);
+      return;
+    }
+    if (!selectedEl || !selectedEl.isConnected) {
+      const first = firstSelectable();
+      if (first) chooseSelection(first);
+      return;
+    }
+    const peer = peerInDirection(selectedEl, direction);
+    if (peer) {
+      chooseSelection(peer);
+      showToast("同层：" + elementLabel(peer));
+      return;
+    }
+    if (direction === "left") {
+      const parent = layoutAncestor(selectedEl);
+      if (parent && parent !== document.body) {
+        chooseSelection(parent);
+        showToast("父级：" + elementLabel(parent));
+        return;
+      }
+    }
+    if (direction === "right") {
+      const children = layoutChildren(selectedEl);
+      if (children.length) {
+        chooseSelection(children[0]);
+        showToast("子级：" + elementLabel(children[0]));
+        return;
+      }
+    }
+    showToast("这一层的这个方向没有别的模块");
+  }
+
+  function nudgeSelection(direction, shifted) {
+    if (!selectedEl) return;
+    const step = shifted ? 10 : 1;
+    const tr = selectedEl.style.transform || "";
+    let curX = 0;
+    let curY = 0;
+    const matched = tr.match(/translate(?:3d)?\(([-0-9.]+)px,\s*([-0-9.]+)px/);
+    if (matched) {
+      curX = parseFloat(matched[1]);
+      curY = parseFloat(matched[2]);
+    }
+    if (direction === "up") curY -= step;
+    if (direction === "down") curY += step;
+    if (direction === "left") curX -= step;
+    if (direction === "right") curX += step;
+    selectedEl.style.transform = `translate3d(${curX}px, ${curY}px, 0)`;
+    recordDragPosition(selectedEl, curX, curY, `键盘微调 (${step}px)`);
+    updateSelection();
+    tuneHud.textContent = `坐标: X:${curX > 0 ? "+" : ""}${curX}px, Y:${curY > 0 ? "+" : ""}${curY}px (${step}px)`;
+    tuneHud.style.display = "block";
+    clearTimeout(tuneHud._timer);
+    tuneHud._timer = setTimeout(() => { tuneHud.style.display = "none"; }, 1500);
   }
 
   function getReadableSelector(el) {
@@ -1155,6 +1376,7 @@
     if (!selectedEl || !selectedEl.isConnected) {
       selectBox.style.display = "none";
       toolbar.style.display = "none";
+      if (studioMode) publishDockedToolbar();
       return;
     }
     const rect = selectedEl.getBoundingClientRect();
@@ -1167,6 +1389,14 @@
 
     if (isResizing) {
       toolbar.style.display = "none";
+      return;
+    }
+
+    if (studioMode) {
+      toolbar.style.display = "none";
+      publishDockedToolbar();
+      updateHistoryButtons();
+      updateSnapUI();
       return;
     }
 
@@ -1611,8 +1841,8 @@
     if (inlineEditingEl) return; // Allow normal typing in inline text edit mode
 
     // Check if user is typing in an input or textarea
-    const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : "";
-    const isEditingInput = activeTag === "input" || activeTag === "textarea" || (shadow.activeElement && shadow.activeElement.tagName.toLowerCase() === "textarea");
+    const isFormField = (el) => !!(el && (el.isContentEditable || (el.closest && el.closest("input, textarea, select"))));
+    const isEditingInput = isFormField(document.activeElement) || isFormField(shadow.activeElement);
 
     // Escape key handling: close modals, deselect element, or close dock
     if (e.key === "Escape") {
@@ -1650,6 +1880,16 @@
       }
     }
 
+    if ((e.ctrlKey || e.metaKey) && !isEditingInput) {
+      const key = e.key.toLowerCase();
+      const selectedText = window.getSelection ? String(window.getSelection()) : "";
+      if (key === "c" && e.shiftKey) { e.preventDefault(); copyStyle(); return; }
+      if (key === "v" && e.shiftKey) { e.preventDefault(); pasteStyle(); return; }
+      if (key === "c" && !selectedText) { e.preventDefault(); copyModule(); return; }
+      if (key === "x") { e.preventDefault(); cutModule(); return; }
+      if (key === "v") { e.preventDefault(); pasteClipboard(); return; }
+    }
+
     // Toggle Snapping with 'S' key
     if (!isEditingInput && e.key.toLowerCase() === "s" && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
@@ -1670,36 +1910,9 @@
       }
     }
 
-    // Arrow keys fine-tuning on selected element
-    if (selectedEl && !isEditingInput) {
-      if (["arrowup", "arrowdown", "arrowleft", "arrowright"].includes(e.key.toLowerCase())) {
-        e.preventDefault();
-        const step = e.shiftKey ? 10 : 1;
-
-        // Current translate
-        const tr = selectedEl.style.transform || "";
-        let curX = 0, curY = 0;
-        const m = tr.match(/translate(?:3d)?\(([-0-9.]+)px,\s*([-0-9.]+)px/);
-        if (m) {
-          curX = parseFloat(m[1]);
-          curY = parseFloat(m[2]);
-        }
-
-        if (e.key.toLowerCase() === "arrowup") curY -= step;
-        if (e.key.toLowerCase() === "arrowdown") curY += step;
-        if (e.key.toLowerCase() === "arrowleft") curX -= step;
-        if (e.key.toLowerCase() === "arrowright") curX += step;
-
-        selectedEl.style.transform = `translate3d(${curX}px, ${curY}px, 0)`;
-        recordDragPosition(selectedEl, curX, curY, `键盘微调 (${step}px)`);
-        updateSelection();
-
-        // Show HUD
-        tuneHud.textContent = `坐标: X:${curX > 0 ? '+' : ''}${curX}px, Y:${curY > 0 ? '+' : ''}${curY}px (${step}px)`;
-        tuneHud.style.display = "block";
-        clearTimeout(tuneHud._timer);
-        tuneHud._timer = setTimeout(() => { tuneHud.style.display = "none"; }, 1500);
-      }
+    if (!isEditingInput && ["arrowup", "arrowdown", "arrowleft", "arrowright"].includes(e.key.toLowerCase())) {
+      e.preventDefault();
+      moveSelection(e.key, e.shiftKey);
     }
   });
 
@@ -1845,9 +2058,9 @@
       <div class="tb-header" title="按住可拖动悬浮窗 · 双击恢复自动跟随">
         <div class="tb-title-group">
           <span class="tb-drag-grip" title="按住拖拽悬浮窗位置">⠿</span>
-          <div class="tb-comp-name-chip" id="tb-copy-comp-name" title="点击复制选择器 (${summary.selector})">
+          <div class="tb-comp-name-chip" id="tb-copy-comp-name" title="点击复制选择器 (${escapeHtml(summary.selector)})">
             <span class="tb-tag-badge">&lt;${el.tagName.toLowerCase()}&gt;</span>
-            <div class="tb-title">${summary.selector}</div>
+            <div class="tb-title">${escapeHtml(summary.selector)}</div>
             <span class="tb-copy-hint">复制</span>
           </div>
           <button class="tb-parent-btn" id="tb-select-parent" title="向上选中外层父容器">↑ 父级</button>
@@ -2019,13 +2232,47 @@
         </div>
       </div>
 
-      <!-- 5. 需求批注 -->
+      <!-- 5. 模块与样式剪贴板 -->
+      <div class="word-group-box">
+        <div class="word-group-header">
+          <span>模块与样式</span>
+          <span class="word-group-badge">Clipboard</span>
+        </div>
+        <div class="word-arrange-grid">
+          <button class="word-arrange-btn" id="clip-copy" type="button" title="复制当前模块 (Ctrl+C)">
+            <span>复制模块</span>
+            <span class="btn-subtext">Ctrl+C</span>
+          </button>
+          <button class="word-arrange-btn" id="clip-cut" type="button" title="剪切当前模块 (Ctrl+X)">
+            <span>剪切模块</span>
+            <span class="btn-subtext">Ctrl+X</span>
+          </button>
+          <button class="word-arrange-btn" id="clip-paste" type="button" title="粘贴到当前模块后面 (Ctrl+V)">
+            <span>粘贴模块</span>
+            <span class="btn-subtext">Ctrl+V</span>
+          </button>
+          <button class="word-arrange-btn" id="clip-copy-style" type="button" title="复制当前模块的样式 (Ctrl+Shift+C)">
+            <span>复制样式</span>
+            <span class="btn-subtext">Ctrl+Shift+C</span>
+          </button>
+          <button class="word-arrange-btn" id="clip-paste-style" type="button" title="把样式贴到当前模块 (Ctrl+Shift+V)">
+            <span>粘贴样式</span>
+            <span class="btn-subtext">Ctrl+Shift+V</span>
+          </button>
+          <button class="word-arrange-btn" id="clip-dup" type="button" title="复制一份，紧挨着放在后面">
+            <span>原地复制</span>
+            <span class="btn-subtext">再来一份</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 6. 需求批注 -->
       <div class="word-group-box">
         <div class="word-group-header">
           <span>需求批注</span>
           <span class="word-group-badge" style="background:#f1f5f9; color:#475569;">Prompt</span>
         </div>
-        <textarea class="tb-comment-input" id="tb-comment-field" placeholder="输入对此组件的交互或业务逻辑要求，将随 Prompt 一并导出...">${entry.comment || ''}</textarea>
+        <textarea class="tb-comment-input" id="tb-comment-field" placeholder="输入对此组件的交互或业务逻辑要求，将随 Prompt 一并导出...">${escapeHtml(entry.comment || "")}</textarea>
       </div>
     `;
 
@@ -2049,34 +2296,31 @@
       };
     }
 
-    // Select Parent container button
+    // Select Parent container button. Skip invisible and display:contents wrappers.
     const selectParentBtn = toolbar.querySelector("#tb-select-parent");
     if (selectParentBtn) {
-      if (!el.parentElement || el.parentElement === document.body || el.parentElement === document.documentElement) {
+      const parent = layoutAncestor(el);
+      if (!parent) {
         selectParentBtn.disabled = true;
         selectParentBtn.style.opacity = "0.4";
         selectParentBtn.style.cursor = "not-allowed";
+        selectParentBtn.title = "已经是最外层";
       } else {
         selectParentBtn.onclick = (e) => {
           e.stopPropagation();
-          const parent = el.parentElement;
           selectedEl = parent;
           renderToolbar(parent);
           updateSelection();
-          showToast(`已选中父级: <${parent.tagName.toLowerCase()}> ${parent.className ? '.' + parent.className.split(' ')[0] : ''}`);
+          if (parent.scrollIntoView) parent.scrollIntoView({ block: "nearest", inline: "nearest" });
+          showToast(`已选中父级: ${elementLabel(parent)}`);
         };
       }
     }
 
-    // Select Child element button (Cycles through children)
+    // Select Child element button. Dive through empty wrappers so nested blocks can be reached.
     const selectChildBtn = toolbar.querySelector("#tb-select-child");
     if (selectChildBtn) {
-      const validChildren = Array.from(el.children || []).filter(c => {
-        return c.nodeType === 1 && 
-               !c.hasAttribute("data-canvascode-ignore") &&
-               !c.classList.contains("canvascode-host") &&
-               !['SCRIPT', 'STYLE', 'LINK', 'BR'].includes(c.tagName);
-      });
+      const validChildren = layoutChildren(el);
 
       if (validChildren.length === 0) {
         selectChildBtn.disabled = true;
@@ -2084,22 +2328,19 @@
         selectChildBtn.style.cursor = "not-allowed";
         selectChildBtn.title = "当前元素内无子组件";
       } else {
+        selectChildBtn.title = validChildren.length > 1 ? `向下选中，共 ${validChildren.length} 个` : "向下选中内部子元素";
         selectChildBtn.onclick = (e) => {
           e.stopPropagation();
-          let nextIdx = 0;
-          if (el.__lastChildIdx !== undefined) {
-            nextIdx = (el.__lastChildIdx + 1) % validChildren.length;
-          }
+          const nextIdx = el.__lastChildIdx === undefined ? 0 : (el.__lastChildIdx + 1) % validChildren.length;
           el.__lastChildIdx = nextIdx;
           const targetChild = validChildren[nextIdx];
 
           selectedEl = targetChild;
           renderToolbar(targetChild);
           updateSelection();
-          const tag = targetChild.tagName.toLowerCase();
-          const cls = targetChild.className ? '.' + targetChild.className.split(' ')[0] : '';
-          const countInfo = validChildren.length > 1 ? ` (${nextIdx + 1}/${validChildren.length})` : '';
-          showToast(`已选中子级: <${tag}> ${cls}${countInfo}`);
+          if (targetChild.scrollIntoView) targetChild.scrollIntoView({ block: "nearest", inline: "nearest" });
+          const countInfo = validChildren.length > 1 ? ` (${nextIdx + 1}/${validChildren.length})` : "";
+          showToast(`已选中子级: ${elementLabel(targetChild)}${countInfo}`);
         };
       }
     }
@@ -2249,7 +2490,9 @@
       const val = parseInt(e.target.value);
       el.style.borderRadius = `${val}px`;
       rValBadge.textContent = `${val}px`;
+      suppressToolbarPublish = true;
       updateSelection();
+      suppressToolbarPublish = false;
     });
 
     // Commit change to history stack and AI prompt on release
@@ -2318,7 +2561,22 @@
       }
     };
 
+    toolbar.querySelector("#clip-copy").onclick = () => copyModule();
+    toolbar.querySelector("#clip-cut").onclick = () => cutModule();
+    toolbar.querySelector("#clip-paste").onclick = () => pasteModule();
+    toolbar.querySelector("#clip-copy-style").onclick = () => copyStyle();
+    toolbar.querySelector("#clip-paste-style").onclick = () => pasteStyle();
+    toolbar.querySelector("#clip-dup").onclick = () => duplicateModule();
+
+    if (studioMode) {
+      const grip = toolbar.querySelector(".tb-drag-grip");
+      if (grip) grip.remove();
+      const header = toolbar.querySelector(".tb-header");
+      if (header) header.title = "样式面板固定在右侧栏";
+    }
+
     updateHistoryButtons();
+    publishDockedToolbar();
   }
 
   // --- PROMPT COMPILER ---
@@ -2361,14 +2619,50 @@ ${itemsMarkdown}
 
   // --- INLINE WYSIWYG DIRECT TEXT EDITING (PPT / Figma in-place style) ---
   let inlineEditingEl = null;
-  let inlineEditingOriginalText = "";
+  let inlineEditingOriginalHTML = "";
+  let swallowEditBreak = false;
+
+  function recordHtmlChange(el, prevHTML, nextHTML) {
+    const entry = initChangeEntry(el);
+    if (!entry.originalHTML) entry.originalHTML = prevHTML;
+    pushHistory({
+      type: "html",
+      el,
+      prevHTML,
+      nextHTML,
+      originalHTML: entry.originalHTML,
+      label: "修改文本与换行"
+    });
+    entry.mods.html = {
+      original: "原始文字与换行",
+      current: "已修改文字或换行",
+      label: "修改文本与换行",
+      tailwind: "保留原有加粗、颜色标签"
+    };
+    updateSelection();
+    updateDock();
+  }
+
+  function insertLineBreak() {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount || !inlineEditingEl) return;
+    const range = sel.getRangeAt(0);
+    if (!inlineEditingEl.contains(range.commonAncestorContainer)) return;
+    range.collapse(false);
+    const br = document.createElement("br");
+    range.insertNode(br);
+    range.setStartAfter(br);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
 
   function startInlineTextEdit(target) {
     if (!target) return;
     if (inlineEditingEl) finishInlineTextEdit(true);
 
     inlineEditingEl = target;
-    inlineEditingOriginalText = (target.innerText || target.textContent || "").trim();
+    inlineEditingOriginalHTML = target.innerHTML;
 
     // Hide selection box, toolbar and hover highlight during editing
     if (selectBox) selectBox.style.display = "none";
@@ -2382,25 +2676,36 @@ ${itemsMarkdown}
     target.style.cursor = "text";
     target.focus();
 
-    // Select text for quick inline replacement
-    try {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(target);
-      sel.removeAllRanges();
-      sel.addRange(range);
-    } catch (err) {}
-
-    showToast("进入文本编辑模式（Enter 保存，Esc 取消）");
+    showToast("文本编辑：Enter 换行，Ctrl+Enter 完成，Esc 还原");
 
     function onInlineKeyDown(e) {
-      if (e.key === "Enter" && !e.shiftKey) {
+      if (!inlineEditingEl || inlineEditingEl !== target) return;
+      const inside = e.target === target || target.contains(e.target);
+      if (!inside) return;
+      if (e.key === "Escape") {
         e.preventDefault();
-        finishInlineTextEdit(true);
-      } else if (e.key === "Escape") {
-        e.preventDefault();
+        e.stopPropagation();
         finishInlineTextEdit(false);
+        return;
       }
+      const isEnter = e.key === "Enter" || e.code === "Enter" || e.code === "NumpadEnter" || e.keyCode === 13 || e.keyCode === 10;
+      if (!isEnter) return;
+      e.preventDefault();
+      e.stopPropagation();
+      swallowEditBreak = true;
+      const control = e.ctrlKey || e.metaKey || e.keyCode === 10 || (e.getModifierState && (e.getModifierState("Control") || e.getModifierState("Meta")));
+      if (control) finishInlineTextEdit(true);
+      else insertLineBreak();
+      setTimeout(() => { swallowEditBreak = false; }, 0);
+    }
+
+    function onInlineBeforeInput(e) {
+      if (e.inputType !== "insertParagraph" && e.inputType !== "insertLineBreak") return;
+      const stillEditing = inlineEditingEl === target && (e.target === target || target.contains(e.target));
+      if (!stillEditing && !swallowEditBreak) return;
+      e.preventDefault();
+      e.stopPropagation();
+      swallowEditBreak = false;
     }
 
     function onInlineBlur() {
@@ -2412,8 +2717,10 @@ ${itemsMarkdown}
     }
 
     target._canvascodeKeyDown = onInlineKeyDown;
+    target._canvascodeBeforeInput = onInlineBeforeInput;
     target._canvascodeBlur = onInlineBlur;
-    target.addEventListener("keydown", onInlineKeyDown);
+    document.addEventListener("keydown", onInlineKeyDown, true);
+    document.addEventListener("beforeinput", onInlineBeforeInput, true);
     target.addEventListener("blur", onInlineBlur, { once: true });
   }
 
@@ -2423,8 +2730,12 @@ ${itemsMarkdown}
     inlineEditingEl = null;
 
     if (el._canvascodeKeyDown) {
-      el.removeEventListener("keydown", el._canvascodeKeyDown);
+      document.removeEventListener("keydown", el._canvascodeKeyDown, true);
       delete el._canvascodeKeyDown;
+    }
+    if (el._canvascodeBeforeInput) {
+      document.removeEventListener("beforeinput", el._canvascodeBeforeInput, true);
+      delete el._canvascodeBeforeInput;
     }
     if (el._canvascodeBlur) {
       el.removeEventListener("blur", el._canvascodeBlur);
@@ -2437,19 +2748,24 @@ ${itemsMarkdown}
     el.style.cursor = "";
 
     if (save) {
-      const currentText = (el.innerText || el.textContent || "").trim();
-      if (currentText !== inlineEditingOriginalText) {
-        recordChange(el, "innerText", currentText, `文案修改为 "${currentText}"`);
-        showToast(`文本已更新: "${currentText}"`);
+      if (el.innerHTML !== inlineEditingOriginalHTML) {
+        recordHtmlChange(el, inlineEditingOriginalHTML, el.innerHTML);
+        showToast("文字和换行已更新，Ctrl+Z 可还原加粗与颜色");
       }
     } else {
-      el.innerText = inlineEditingOriginalText;
-      showToast("已取消文案编辑");
+      el.innerHTML = inlineEditingOriginalHTML;
+      showToast("已还原这段文字");
     }
 
     selectedEl = el;
     renderToolbar(selectedEl);
     updateSelection();
+  }
+
+  // Controls keep working while tweak mode is on. Hold Alt to select them for editing.
+  function isPageControlTarget(target) {
+    if (!target || !target.closest) return false;
+    return !!target.closest("input, textarea, select, option, button, label, summary");
   }
 
   // --- MOUSE LISTENERS ---
@@ -2465,21 +2781,27 @@ ${itemsMarkdown}
       hoverBox.style.display = "none";
       return;
     }
+    if (!e.altKey && isPageControlTarget(target)) {
+      hoverBox.style.display = "none";
+      return;
+    }
+    const anchor = target.closest ? target.closest("a[href]") : null;
+    const hoverTarget = anchor || target;
 
-    if (target === document.body || target === document.documentElement) {
+    if (hoverTarget === document.body || hoverTarget === document.documentElement) {
       hoverBox.style.display = "none";
       return;
     }
 
-    hoveredEl = target;
-    const rect = target.getBoundingClientRect();
+    hoveredEl = hoverTarget;
+    const rect = hoverTarget.getBoundingClientRect();
     hoverBox.style.display = "block";
     hoverBox.style.top = rect.top + "px";
     hoverBox.style.left = rect.left + "px";
     hoverBox.style.width = rect.width + "px";
     hoverBox.style.height = rect.height + "px";
 
-    const summary = getElementSummary(target);
+    const summary = getElementSummary(hoverTarget);
     hoverTag.textContent = `${summary.selector} (${Math.round(rect.width)}×${Math.round(rect.height)})`;
   }
 
@@ -2494,6 +2816,17 @@ ${itemsMarkdown}
     const target = e.target;
     if (host.contains(target) || target === host) return;
     if (target.closest && target.closest("[data-canvascode-ignore]")) return;
+    const anchor = target.closest ? target.closest("a[href]") : null;
+    if (anchor) {
+      if (!anchorStaysOnPage(anchor)) {
+        e.preventDefault();
+        e.stopPropagation();
+        showToast("已选中链接，不会离开当前页。双击可改文字；顶部「返回首页」回到打开的文件");
+      }
+      chooseSelection(anchor);
+      return;
+    }
+    if (!e.altKey && isPageControlTarget(target)) return;
 
     // Clicking on body or html background deselects current component
     if (target === document.body || target === document.documentElement) {
@@ -2520,15 +2853,41 @@ ${itemsMarkdown}
     const target = e.target;
     if (host.contains(target) || target === host) return;
     if (target.closest && target.closest("[data-canvascode-ignore]")) return;
-    if (target === document.body || target === document.documentElement) return;
+    const anchor = target.closest ? target.closest("a[href]") : null;
+    if (!anchor && !e.altKey && isPageControlTarget(target)) return;
+    if ((anchor || target) === document.body || (anchor || target) === document.documentElement) return;
 
     e.preventDefault();
     e.stopPropagation();
 
-    // Start direct in-place editing!
-    startInlineTextEdit(target);
+    // Start direct in-place editing. Links edit as a whole, including 返回首页.
+    startInlineTextEdit(anchor || target);
   }
 
+  function anchorStaysOnPage(anchor) {
+    if (!anchor || anchor.tagName !== "A") return true;
+    if (anchor.hasAttribute("download")) return false;
+    const target = (anchor.getAttribute("target") || "").trim().toLowerCase();
+    if (target && target !== "_self") return false;
+    const raw = (anchor.getAttribute("href") || "").trim();
+    if (!raw || raw === "#" || raw.charAt(0) === "#") return true;
+    if (/^javascript:/i.test(raw)) return true;
+    let url;
+    try { url = new URL(anchor.href, window.location.href); } catch (err) { return false; }
+    if (url.protocol === "javascript:") return true;
+    if (url.origin !== window.location.origin) return false;
+    return url.pathname === window.location.pathname && url.search === window.location.search;
+  }
+
+  function onLinkGuard(e) {
+    if (!window.__aiVisualTweakActive) return;
+    const anchor = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+    if (!anchor || anchorStaysOnPage(anchor)) return;
+    e.preventDefault();
+  }
+
+  window.addEventListener("click", onLinkGuard, true);
+  window.addEventListener("auxclick", onLinkGuard, true);
   window.addEventListener("mousemove", onMouseMove, true);
   window.addEventListener("click", onClick, true);
   window.addEventListener("dblclick", onDblClick, true);
@@ -2736,7 +3095,155 @@ ${itemsMarkdown}
     setTweakActiveMode(false);
   };
 
+  function readStyleSnapshot(el) {
+    const props = {};
+    for (let i = 0; i < el.style.length; i++) {
+      const name = el.style.item(i);
+      const value = el.style.getPropertyValue(name);
+      if (value) props[name] = value;
+    }
+    const computed = window.getComputedStyle(el);
+    VISUAL_STYLE_PROPS.forEach((prop) => {
+      if (!props[prop] && computed[prop]) props[prop] = computed[prop];
+    });
+    return props;
+  }
+
+  function rememberModule(el) {
+    clip = { kind: "module", html: el.outerHTML };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(el.outerHTML).catch(() => {});
+    }
+  }
+
+  function copyModule() {
+    if (!selectedEl || !selectedEl.isConnected) {
+      showToast("先点选一个模块");
+      return;
+    }
+    rememberModule(selectedEl);
+    showToast("已复制模块");
+  }
+
+  function cutModule() {
+    const el = selectedEl;
+    if (!el || !el.isConnected || el === document.body || el === document.documentElement) {
+      showToast("先点选要剪切的模块");
+      return;
+    }
+    const parent = el.parentElement;
+    if (!parent) return;
+    rememberModule(el);
+    const next = el.nextSibling;
+    pushHistory({ type: "dom", kind: "cut", el, parent, next, label: "剪切模块" });
+    if (selectedEl === el) selectedEl = null;
+    el.remove();
+    updateSelection();
+    updateDock();
+    showToast("已剪切模块");
+  }
+
+  function pasteModule() {
+    if (!clip || clip.kind !== "module" || !clip.html) {
+      showToast("剪贴板里没有模块");
+      return;
+    }
+    const holder = document.createElement("div");
+    holder.innerHTML = clip.html;
+    const node = holder.firstElementChild;
+    if (!node) {
+      showToast("模块内容无法粘贴");
+      return;
+    }
+    [node].concat(Array.from(node.querySelectorAll("[id]"))).forEach((item) => {
+      if (item.id && document.getElementById(item.id)) item.removeAttribute("id");
+    });
+    const anchor = selectedEl && selectedEl.isConnected ? selectedEl : null;
+    const parent = anchor ? anchor.parentElement : document.body;
+    if (!parent) return;
+    const next = anchor ? anchor.nextSibling : null;
+    if (next) parent.insertBefore(node, next);
+    else parent.appendChild(node);
+    pushHistory({ type: "dom", kind: "paste", el: node, parent, next, label: "粘贴模块" });
+    selectedEl = node;
+    renderToolbar(node);
+    updateSelection();
+    showToast("已粘贴模块");
+  }
+
+  function duplicateModule() {
+    if (!selectedEl || !selectedEl.isConnected) {
+      showToast("先点选一个模块");
+      return;
+    }
+    rememberModule(selectedEl);
+    pasteModule();
+  }
+
+  function copyStyle() {
+    if (!selectedEl || !selectedEl.isConnected) {
+      showToast("先点选一个模块");
+      return;
+    }
+    clip = { kind: "style", props: readStyleSnapshot(selectedEl) };
+    showToast("已复制样式");
+  }
+
+  function pasteStyle() {
+    if (!selectedEl || !selectedEl.isConnected) {
+      showToast("先点选要贴上样式的模块");
+      return;
+    }
+    if (!clip || clip.kind !== "style" || !clip.props) {
+      showToast("剪贴板里没有样式");
+      return;
+    }
+    Object.keys(clip.props).forEach((prop) => {
+      recordChange(selectedEl, prop, clip.props[prop], "粘贴样式");
+    });
+    renderToolbar(selectedEl);
+    showToast("已粘贴样式");
+  }
+
+  function pasteClipboard() {
+    if (clip && clip.kind === "style") pasteStyle();
+    else pasteModule();
+  }
+
+  function exportCleanHtml() {
+    if (inlineEditingEl) finishInlineTextEdit(true);
+    const root = document.documentElement.cloneNode(true);
+    root.querySelectorAll("#" + HOST_ID + ", #canvascode-engine-script").forEach((node) => node.remove());
+    const doctype = document.doctype ? "<!DOCTYPE " + document.doctype.name + ">" : "<!DOCTYPE html>";
+    return doctype + "\n" + root.outerHTML;
+  }
+
   // --- STUDIO DESKTOP WORKBENCH BRIDGE ---
+  function publishDockedToolbar() {
+    if (!studioMode || suppressToolbarPublish) return;
+    let html = "";
+    if (selectedEl && selectedEl.isConnected && toolbar) {
+      let index = 0;
+      toolbar.querySelectorAll("button, input, textarea, .color-swatch, .txt-color-swatch, .tb-comp-name-chip").forEach((node) => {
+        node.setAttribute("data-cc", String(index++));
+      });
+      html = toolbar.innerHTML;
+    }
+    if (html === lastDockedHtml && dockCssSent) return;
+    lastDockedHtml = html;
+    const detail = { html: html };
+    if (!dockCssSent) {
+      detail.css = style.textContent;
+      dockCssSent = true;
+    }
+    postStudio("toolbar", detail);
+  }
+
+  function postStudio(type, detail) {
+    if (!window.parent || window.parent === window) return;
+    window.parent.postMessage({ source: "canvascode", type, detail }, "*");
+  }
+
   function notifyStudioSelection(el) {
     if (!el) return;
     try {
@@ -2758,9 +3265,7 @@ ${itemsMarkdown}
         selector: summary.selector
       };
       window.dispatchEvent(new CustomEvent("canvascode:elementSelected", { detail }));
-      if (window.parent && window.parent !== window) {
-        window.parent.dispatchEvent(new CustomEvent("canvascode:elementSelected", { detail }));
-      }
+      postStudio("elementSelected", detail);
     } catch (err) {}
   }
 
@@ -2782,9 +3287,7 @@ ${itemsMarkdown}
         history: historyList
       };
       window.dispatchEvent(new CustomEvent("canvascode:stateChanged", { detail }));
-      if (window.parent && window.parent !== window) {
-        window.parent.dispatchEvent(new CustomEvent("canvascode:stateChanged", { detail }));
-      }
+      postStudio("stateChanged", detail);
     } catch (err) {}
   }
 
@@ -2824,6 +3327,46 @@ ${itemsMarkdown}
   window.__canvascodeResetAll = () => {
     btnResetAll.click();
   };
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || data.source !== "canvascode-parent" || event.source !== window.parent) return;
+    if (data.type === "inspector") window.__canvascodeApplyInspectorUpdate(data.props || {});
+    if (data.type === "undo") undo();
+    if (data.type === "redo") redo();
+    if (data.type === "snap") window.__canvascodeToggleSnap(data.enabled);
+    if (data.type === "export") window.__canvascodeTriggerExport();
+    if (data.type === "reset") window.__canvascodeResetAll();
+    if (data.type === "toolbar") {
+      const cc = String(data.cc || "");
+      if (!/^\d+$/.test(cc)) return;
+      const node = toolbar.querySelector('[data-cc="' + cc + '"]');
+      if (!node) return;
+      if (data.kind === "click") {
+        suppressToolbarPublish = true;
+        node.click();
+        suppressToolbarPublish = false;
+        publishDockedToolbar();
+      } else if (data.kind === "input" || data.kind === "change") {
+        node.value = data.value == null ? "" : String(data.value);
+        if (data.kind === "input") suppressToolbarPublish = true;
+        node.dispatchEvent(new Event(data.kind, { bubbles: true }));
+        if (data.kind === "input") suppressToolbarPublish = false;
+        if (data.kind === "change") publishDockedToolbar();
+      }
+    }
+    if (data.type === "clipboard") {
+      if (data.op === "copy") copyModule();
+      if (data.op === "cut") cutModule();
+      if (data.op === "paste") pasteClipboard();
+      if (data.op === "copyStyle") copyStyle();
+      if (data.op === "pasteStyle") pasteStyle();
+    }
+    if (data.type === "navigateSelection") moveSelection(data.key, !!data.shift);
+    if (data.type === "exportHtml") {
+      postStudio("cleanHtml", { requestId: data.requestId, html: exportCleanHtml() });
+    }
+  });
 
   updateHistoryButtons();
   showToast("CanvasCode 已就绪");

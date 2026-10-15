@@ -1,5 +1,7 @@
 # CanvasCode
 
+本仓库基于 [al1830329386-dev/canvascode](https://github.com/al1830329386-dev/canvascode) 继续修改，补上桌面端预览、样式面板、本地 HTML 写回等功能。可运行程序在 [Releases](https://github.com/ZeonMacha/canvascode/releases) 下载 `canvascode-studio.exe`。
+
 <div align="center">
 
 <p><strong>In-Browser Visual DOM Inspector & Multimodal AI Prompt Compiler</strong></p>
