@@ -1081,11 +1081,11 @@
     if (el.scrollIntoView) el.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
-  function moveSelection(key, shiftKey) {
+  function moveSelection(key, shiftKey, hierarchy) {
     const direction = String(key || "").toLowerCase().replace("arrow", "");
     if (!["up", "down", "left", "right"].includes(direction)) return;
-    if (shiftKey && selectedEl) {
-      nudgeSelection(direction, true);
+    if (!hierarchy) {
+      nudgeSelection(direction, !!shiftKey);
       return;
     }
     if (!selectedEl || !selectedEl.isConnected) {
@@ -1912,7 +1912,7 @@
 
     if (!isEditingInput && ["arrowup", "arrowdown", "arrowleft", "arrowright"].includes(e.key.toLowerCase())) {
       e.preventDefault();
-      moveSelection(e.key, e.shiftKey);
+      moveSelection(e.key, e.shiftKey, e.ctrlKey || e.metaKey || e.altKey);
     }
   });
 
@@ -3362,7 +3362,7 @@ ${itemsMarkdown}
       if (data.op === "copyStyle") copyStyle();
       if (data.op === "pasteStyle") pasteStyle();
     }
-    if (data.type === "navigateSelection") moveSelection(data.key, !!data.shift);
+    if (data.type === "navigateSelection") moveSelection(data.key, !!data.shift, !!data.hierarchy);
     if (data.type === "exportHtml") {
       postStudio("cleanHtml", { requestId: data.requestId, html: exportCleanHtml() });
     }

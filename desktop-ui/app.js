@@ -465,9 +465,13 @@
     const shadowTyping = shadowField && shadowField.matches && shadowField.matches("input, textarea, select");
     const selectedText = window.getSelection ? String(window.getSelection()) : "";
     if (typing || shadowTyping) return;
-    if (!event.ctrlKey && !event.metaKey && !event.altKey && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
       event.preventDefault();
-      postToPreview("navigateSelection", { key: event.key, shift: event.shiftKey });
+      postToPreview("navigateSelection", {
+        key: event.key,
+        shift: event.shiftKey,
+        hierarchy: !!(event.ctrlKey || event.metaKey || event.altKey)
+      });
       return;
     }
     if (!(event.ctrlKey || event.metaKey)) return;
